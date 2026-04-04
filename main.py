@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import discord
@@ -80,20 +81,19 @@ def format_seconds(sec: int) -> str:
     return f"{h}시간 {m:02d}분"
 
 
-def load_json(path: str, default: dict) -> dict:
+def load_json(path: str, default):
     if not os.path.exists(path):
         save_json(path, default)
-        return default.copy()
+        return default.copy() if isinstance(default, dict) else default
 
     try:
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else default.copy()
+            return json.load(f)
     except Exception:
-        return default.copy()
+        return default.copy() if isinstance(default, dict) else default
 
 
-def save_json(path: str, data: dict):
+def save_json(path: str, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -115,13 +115,12 @@ def save_message_id(path: str, message_id: int):
 
 def normalize_name(name: str) -> str:
     """
-    직급/장식 제거해서 본이름만 남김
+    직급/장식/이모지/특수문자 제거해서 본이름만 남김
     """
     name = str(name).strip()
     name = name.replace("ㆍ", "ᆞ").replace("·", "ᆞ").replace("•", "ᆞ")
-    name = name.replace(" ", "")
 
-    upper_name = name.upper()
+    upper_name = name.upper().replace(" ", "")
     for prefix in ["(AM)", "(IG)", "(DEV)", "(STAFF)", "(GUIDE)", "(GM)", "(DGM)"]:
         if upper_name.startswith(prefix):
             name = name[len(prefix):]
@@ -129,6 +128,9 @@ def normalize_name(name: str) -> str:
 
     if "ᆞ" in name:
         name = name.split("ᆞ")[-1]
+
+    name = name.replace(" ", "")
+    name = re.sub(r"[^가-힣a-zA-Z0-9]", "", name)
 
     if name.endswith("님"):
         name = name[:-1]
@@ -144,7 +146,10 @@ def normalize_name(name: str) -> str:
 
         "이민우": "이민우",
         "민우": "이민우",
+        "st이민우": "이민우",
+        "st민우": "이민우",
         "minwoo": "이민우",
+        "lee minwoo": "이민우",
 
         "볶음": "볶음",
         "bokkeum": "볶음",
@@ -152,7 +157,6 @@ def normalize_name(name: str) -> str:
         "알루": "알루",
         "alroo": "알루",
         "alru": "알루",
-        "@𝖆𝖑𝖗𝖔𝖔💥".lower(): "알루",
     }
     return alias_map.get(lower, name)
 
@@ -181,28 +185,44 @@ def get_role_prefix(member: discord.Member) -> str:
     ]
 
     for key, label in priority:
-        key = key.upper()
+        ku = key.upper()
         for role_name in role_names:
-            if key in role_name:
+            if ku in role_name:
                 return label
     return ""
 
 
-def get_member_label_from_name(name: str) -> str:
-    """
-    저장은 본이름으로 유지하고, 표시만 현재 디스코드 역할 기준으로 자동 반영
-    """
-    normalized = normalize_name(name)
+def build_member_label(member: discord.Member) -> str:
+    base = normalize_name(member.display_name)
+    prefix = get_role_prefix(member)
+    return f"{prefix}ㆍ{base}" if prefix else base
 
+
+def resolve_uid_for_base_name(base_name: str):
+    target = normalize_name(base_name)
     for guild in bot.guilds:
         for member in guild.members:
             if member.bot:
                 continue
-            if normalize_name(member.display_name) == normalized:
-                prefix = get_role_prefix(member)
-                return f"{prefix}ㆍ{normalized}" if prefix else normalized
+            if normalize_name(member.display_name) == target:
+                return str(member.id)
+    return None
 
-    return normalized
+
+def find_member_by_uid(uid: str):
+    for guild in bot.guilds:
+        member = guild.get_member(int(uid))
+        if member:
+            return member
+    return None
+
+
+def get_label_from_uid_or_name(uid: str = None, base_name: str = None) -> str:
+    if uid:
+        member = find_member_by_uid(uid)
+        if member:
+            return build_member_label(member)
+    return normalize_name(base_name or "알수없음")
 
 
 async def send_log(text: str):
@@ -224,68 +244,94 @@ async def send_promo_log(text: str):
 
 
 # =========================
-# 출퇴근 데이터
+# 출퇴근 데이터 (user_id 기반)
 # =========================
+def make_attendance_entry(uid: str, base_name: str, total: int = 0, working: bool = False, start: int = 0) -> dict:
+    return {
+        "user_id": str(uid),
+        "base_name": normalize_name(base_name),
+        "total": int(total),
+        "working": bool(working),
+        "start": int(start) if working else 0
+    }
+
+
+def migrate_attendance(raw: dict) -> dict:
+    migrated = {}
+
+    if not isinstance(raw, dict):
+        raw = {}
+
+    for key, info in raw.items():
+        if not isinstance(info, dict):
+            continue
+
+        raw_name = str(info.get("display_name", key)).strip()
+        base_name = normalize_name(raw_name)
+
+        if not base_name or is_excluded(base_name):
+            continue
+
+        uid = info.get("user_id")
+        if uid:
+            uid = str(uid)
+        else:
+            uid = resolve_uid_for_base_name(base_name)
+
+        if not uid:
+            uid = f"legacy::{base_name}"
+
+        total = int(info.get("total", 0) or 0)
+        working = bool(info.get("working", False))
+        start = int(info.get("start", 0) or 0)
+
+        if uid not in migrated:
+            migrated[uid] = make_attendance_entry(uid, base_name, total, working, start)
+        else:
+            migrated[uid]["total"] += total
+
+            if working:
+                if not migrated[uid]["working"]:
+                    migrated[uid]["working"] = True
+                    migrated[uid]["start"] = start
+                else:
+                    existing_start = int(migrated[uid].get("start", 0) or 0)
+                    if existing_start == 0:
+                        migrated[uid]["start"] = start
+                    elif start > 0:
+                        migrated[uid]["start"] = min(existing_start, start)
+
+    for base_name, sec in DEFAULT_ATTENDANCE.items():
+        uid = resolve_uid_for_base_name(base_name)
+        if not uid:
+            continue
+
+        if uid not in migrated:
+            migrated[uid] = make_attendance_entry(uid, base_name, sec, False, 0)
+        else:
+            if migrated[uid]["total"] < sec:
+                migrated[uid]["total"] = sec
+
+    return migrated
+
+
 def load_attendance() -> dict:
     raw = load_json(ATTENDANCE_FILE, {})
-    return cleanup_attendance(raw)
+    return migrate_attendance(raw)
 
 
 def save_attendance(data: dict):
     save_json(ATTENDANCE_FILE, data)
 
 
-def cleanup_attendance(data: dict) -> dict:
-    cleaned = {}
+def ensure_attendance_user(member: discord.Member, data: dict):
+    uid = str(member.id)
+    base_name = normalize_name(member.display_name)
 
-    for _, info in data.items():
-        raw_name = str(info.get("display_name", "")).strip()
-        name = normalize_name(raw_name)
-
-        if not name:
-            continue
-        if is_excluded(name):
-            continue
-
-        total = int(info.get("total", 0) or 0)
-        working = bool(info.get("working", False))
-        start = int(info.get("start", 0) or 0)
-
-        if name not in cleaned:
-            cleaned[name] = {
-                "display_name": name,
-                "total": total,
-                "working": working,
-                "start": start if working else 0
-            }
-        else:
-            if total > cleaned[name]["total"]:
-                cleaned[name]["total"] = total
-
-            if working:
-                if not cleaned[name]["working"]:
-                    cleaned[name]["working"] = True
-                    cleaned[name]["start"] = start
-                else:
-                    existing_start = int(cleaned[name]["start"] or 0)
-                    if existing_start == 0:
-                        cleaned[name]["start"] = start
-                    elif start > 0:
-                        cleaned[name]["start"] = min(existing_start, start)
-
-    for name, sec in DEFAULT_ATTENDANCE.items():
-        if name not in cleaned:
-            cleaned[name] = {
-                "display_name": name,
-                "total": sec,
-                "working": False,
-                "start": 0
-            }
-        else:
-            if cleaned[name]["total"] < sec:
-                cleaned[name]["total"] = sec
-
-    return cleaned
+    if uid not in data:
+        data[uid] = make_attendance_entry(uid, base_name, DEFAULT_ATTENDANCE.get(base_name, 0), False, 0)
+    else:
+        data[uid]["base_name"] = base_name
 
 
 async def send_record_embed(is_clock_in: bool, member: discord.Member, elapsed: int = 0):
@@ -314,18 +360,17 @@ def build_status_embed(data: dict) -> discord.Embed:
     current_workers = []
     ranking = []
 
-    for _, info in data.items():
-        base_name = info.get("display_name", "알수없음")
-        name = get_member_label_from_name(base_name)
+    for uid, info in data.items():
+        label = get_label_from_uid_or_name(uid, info.get("base_name", "알수없음"))
         total = int(info.get("total", 0) or 0)
         working = bool(info.get("working", False))
         start = int(info.get("start", 0) or 0)
 
         if working and start > 0:
             elapsed = now_ts() - start
-            current_workers.append((name, elapsed))
+            current_workers.append((label, elapsed))
 
-        ranking.append((name, total))
+        ranking.append((label, total))
 
     current_workers.sort(key=lambda x: x[1], reverse=True)
     ranking.sort(key=lambda x: x[1], reverse=True)
@@ -393,32 +438,26 @@ class AttendanceView(discord.ui.View):
             return await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
 
         member = interaction.user
-        name = normalize_name(member.display_name)
+        base_name = normalize_name(member.display_name)
 
-        if is_excluded(name):
+        if is_excluded(base_name):
             return await interaction.response.send_message("제외 대상입니다.", ephemeral=True)
 
         data = load_attendance()
+        ensure_attendance_user(member, data)
+        uid = str(member.id)
 
-        if name not in data:
-            data[name] = {
-                "display_name": name,
-                "total": DEFAULT_ATTENDANCE.get(name, 0),
-                "working": False,
-                "start": 0
-            }
-
-        if data[name]["working"]:
+        if data[uid]["working"]:
             return await interaction.response.send_message("이미 출근 상태입니다.", ephemeral=True)
 
-        data[name]["display_name"] = name
-        data[name]["working"] = True
-        data[name]["start"] = now_ts()
+        data[uid]["base_name"] = base_name
+        data[uid]["working"] = True
+        data[uid]["start"] = now_ts()
         save_attendance(data)
 
         await interaction.response.send_message("🟢 출근 처리되었습니다.", ephemeral=True)
         await send_record_embed(True, member)
-        await send_log(f"🟢 출근 | {name}")
+        await send_log(f"🟢 출근 | {build_member_label(member)}")
         await refresh_status_message()
 
     @discord.ui.button(
@@ -431,27 +470,27 @@ class AttendanceView(discord.ui.View):
             return await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
 
         member = interaction.user
-        name = normalize_name(member.display_name)
-
         data = load_attendance()
+        uid = str(member.id)
 
-        if name not in data:
+        if uid not in data:
             return await interaction.response.send_message("출근 데이터가 없습니다.", ephemeral=True)
 
-        if not data[name]["working"]:
+        if not data[uid]["working"]:
             return await interaction.response.send_message("현재 출근 상태가 아닙니다.", ephemeral=True)
 
-        start = int(data[name].get("start", 0) or 0)
+        start = int(data[uid].get("start", 0) or 0)
         if start <= 0:
-            data[name]["working"] = False
-            data[name]["start"] = 0
+            data[uid]["working"] = False
+            data[uid]["start"] = 0
             save_attendance(data)
             return await interaction.response.send_message("근무 데이터가 꼬여 상태만 해제했습니다.", ephemeral=True)
 
         elapsed = now_ts() - start
-        data[name]["total"] = int(data[name].get("total", 0)) + elapsed
-        data[name]["working"] = False
-        data[name]["start"] = 0
+        data[uid]["total"] = int(data[uid].get("total", 0)) + elapsed
+        data[uid]["working"] = False
+        data[uid]["start"] = 0
+        data[uid]["base_name"] = normalize_name(member.display_name)
         save_attendance(data)
 
         await interaction.response.send_message(
@@ -459,50 +498,90 @@ class AttendanceView(discord.ui.View):
             ephemeral=True
         )
         await send_record_embed(False, member, elapsed)
-        await send_log(f"🔴 퇴근 | {name} (+{format_seconds(elapsed)})")
+        await send_log(f"🔴 퇴근 | {build_member_label(member)} (+{format_seconds(elapsed)})")
         await refresh_status_message()
 
 
 # =========================
-# 홍보 데이터
+# 홍보 데이터 (user_id 기반)
 # =========================
+def make_promo_entry(uid: str, base_name: str, count: int = 0) -> dict:
+    return {
+        "user_id": str(uid),
+        "base_name": normalize_name(base_name),
+        "count": int(count)
+    }
+
+
+def migrate_promo(raw: dict) -> dict:
+    migrated = {}
+
+    if not isinstance(raw, dict):
+        raw = {}
+
+    for key, value in raw.items():
+        uid = None
+        base_name = None
+        count = 0
+
+        if isinstance(value, dict):
+            uid = value.get("user_id")
+            base_name = normalize_name(value.get("base_name", key))
+            count = int(value.get("count", 0) or 0)
+        else:
+            base_name = normalize_name(key)
+            try:
+                count = int(value)
+            except Exception:
+                count = 0
+
+        if not base_name or is_excluded(base_name):
+            continue
+
+        if uid:
+            uid = str(uid)
+        else:
+            uid = resolve_uid_for_base_name(base_name)
+
+        if not uid:
+            uid = f"legacy::{base_name}"
+
+        if uid not in migrated:
+            migrated[uid] = make_promo_entry(uid, base_name, count)
+        else:
+            migrated[uid]["count"] += count
+
+    for base_name, count in DEFAULT_PROMO.items():
+        uid = resolve_uid_for_base_name(base_name)
+        if not uid:
+            continue
+
+        if uid not in migrated:
+            migrated[uid] = make_promo_entry(uid, base_name, count)
+        else:
+            if migrated[uid]["count"] < count:
+                migrated[uid]["count"] = count
+
+    return migrated
+
+
 def load_promo() -> dict:
     raw = load_json(PROMO_FILE, {})
-    return cleanup_promo(raw)
+    return migrate_promo(raw)
 
 
 def save_promo(data: dict):
     save_json(PROMO_FILE, data)
 
 
-def cleanup_promo(data: dict) -> dict:
-    cleaned = {}
+def ensure_promo_user(member: discord.Member, data: dict):
+    uid = str(member.id)
+    base_name = normalize_name(member.display_name)
 
-    for raw_name, count in data.items():
-        name = normalize_name(str(raw_name))
-        if not name:
-            continue
-        if is_excluded(name):
-            continue
-
-        try:
-            count = int(count)
-        except Exception:
-            count = 0
-
-        if name not in cleaned:
-            cleaned[name] = count
-        else:
-            cleaned[name] = max(cleaned[name], count)
-
-    for name, count in DEFAULT_PROMO.items():
-        if name not in cleaned:
-            cleaned[name] = count
-        else:
-            if cleaned[name] < count:
-                cleaned[name] = count
-
-    return cleaned
+    if uid not in data:
+        data[uid] = make_promo_entry(uid, base_name, DEFAULT_PROMO.get(base_name, 0))
+    else:
+        data[uid]["base_name"] = base_name
 
 
 async def refresh_promo_rank_message():
@@ -514,18 +593,21 @@ async def refresh_promo_rank_message():
     data = load_promo()
     save_promo(data)
 
-    sorted_items = sorted(data.items(), key=lambda x: (-x[1], x[0]))
+    sorted_items = sorted(
+        data.items(),
+        key=lambda x: (-int(x[1].get("count", 0)), normalize_name(x[1].get("base_name", "")))
+    )
 
     lines = ["📊 홍보 횟수"]
-    for name, count in sorted_items:
-        label = get_member_label_from_name(name)
-        lines.append(f"{label} — {count}회")
+    for uid, info in sorted_items:
+        label = get_label_from_uid_or_name(uid, info.get("base_name", "알수없음"))
+        lines.append(f"{label} — {int(info.get('count', 0))}회")
 
     lines.append("")
     lines.append("🏆 TOP 10")
-    for idx, (name, count) in enumerate(sorted_items[:10], start=1):
-        label = get_member_label_from_name(name)
-        lines.append(f"{idx}위 {label} — {count}회")
+    for idx, (uid, info) in enumerate(sorted_items[:10], start=1):
+        label = get_label_from_uid_or_name(uid, info.get("base_name", "알수없음"))
+        lines.append(f"{idx}위 {label} — {int(info.get('count', 0))}회")
 
     content = "\n".join(lines)
     msg_id = load_message_id(PROMO_MSG_FILE)
@@ -555,31 +637,30 @@ async def force_clock_out(interaction: discord.Interaction, user: discord.Member
     if not is_admin(interaction.user):
         return await interaction.response.send_message("권한 없음", ephemeral=True)
 
-    name = normalize_name(user.display_name)
     data = load_attendance()
+    ensure_attendance_user(user, data)
+    uid = str(user.id)
 
-    if name not in data:
-        return await interaction.response.send_message("출퇴근 데이터가 없습니다.", ephemeral=True)
-
-    if not data[name]["working"]:
+    if not data[uid]["working"]:
         return await interaction.response.send_message("현재 근무중이 아닙니다.", ephemeral=True)
 
-    start = int(data[name].get("start", 0) or 0)
+    start = int(data[uid].get("start", 0) or 0)
     elapsed = 0
 
     if start > 0:
         elapsed = now_ts() - start
-        data[name]["total"] = int(data[name].get("total", 0)) + elapsed
+        data[uid]["total"] = int(data[uid].get("total", 0)) + elapsed
 
-    data[name]["working"] = False
-    data[name]["start"] = 0
+    data[uid]["working"] = False
+    data[uid]["start"] = 0
+    data[uid]["base_name"] = normalize_name(user.display_name)
     save_attendance(data)
 
     await interaction.response.send_message(
-        f"강제퇴근 완료: {get_member_label_from_name(name)} / 추가 반영 {format_seconds(elapsed)}",
+        f"강제퇴근 완료: {build_member_label(user)} / 추가 반영 {format_seconds(elapsed)}",
         ephemeral=True
     )
-    await send_log(f"🛠 강제퇴근 | {name} (+{format_seconds(elapsed)})")
+    await send_log(f"🛠 강제퇴근 | {build_member_label(user)} (+{format_seconds(elapsed)})")
     await refresh_status_message()
 
 
@@ -591,25 +672,19 @@ async def add_work_time(interaction: discord.Interaction, user: discord.Member, 
     if minutes <= 0:
         return await interaction.response.send_message("1분 이상 입력해주세요.", ephemeral=True)
 
-    name = normalize_name(user.display_name)
     data = load_attendance()
+    ensure_attendance_user(user, data)
+    uid = str(user.id)
 
-    if name not in data:
-        data[name] = {
-            "display_name": name,
-            "total": DEFAULT_ATTENDANCE.get(name, 0),
-            "working": False,
-            "start": 0
-        }
-
-    data[name]["total"] = int(data[name].get("total", 0)) + (minutes * 60)
+    data[uid]["total"] = int(data[uid].get("total", 0)) + (minutes * 60)
+    data[uid]["base_name"] = normalize_name(user.display_name)
     save_attendance(data)
 
     await interaction.response.send_message(
-        f"{get_member_label_from_name(name)} 근무시간 {minutes}분 추가 완료",
+        f"{build_member_label(user)} 근무시간 {minutes}분 추가 완료",
         ephemeral=True
     )
-    await send_log(f"🛠 근무시간추가 | {name} (+{minutes}분)")
+    await send_log(f"🛠 근무시간추가 | {build_member_label(user)} (+{minutes}분)")
     await refresh_status_message()
 
 
@@ -621,20 +696,19 @@ async def remove_work_time(interaction: discord.Interaction, user: discord.Membe
     if minutes <= 0:
         return await interaction.response.send_message("1분 이상 입력해주세요.", ephemeral=True)
 
-    name = normalize_name(user.display_name)
     data = load_attendance()
+    ensure_attendance_user(user, data)
+    uid = str(user.id)
 
-    if name not in data:
-        return await interaction.response.send_message("출퇴근 데이터가 없습니다.", ephemeral=True)
-
-    data[name]["total"] = max(0, int(data[name].get("total", 0)) - (minutes * 60))
+    data[uid]["total"] = max(0, int(data[uid].get("total", 0)) - (minutes * 60))
+    data[uid]["base_name"] = normalize_name(user.display_name)
     save_attendance(data)
 
     await interaction.response.send_message(
-        f"{get_member_label_from_name(name)} 근무시간 {minutes}분 차감 완료",
+        f"{build_member_label(user)} 근무시간 {minutes}분 차감 완료",
         ephemeral=True
     )
-    await send_log(f"🛠 근무시간차감 | {name} (-{minutes}분)")
+    await send_log(f"🛠 근무시간차감 | {build_member_label(user)} (-{minutes}분)")
     await refresh_status_message()
 
 
@@ -643,22 +717,16 @@ async def reset_work_time(interaction: discord.Interaction, user: discord.Member
     if not is_admin(interaction.user):
         return await interaction.response.send_message("권한 없음", ephemeral=True)
 
-    name = normalize_name(user.display_name)
     data = load_attendance()
-
-    data[name] = {
-        "display_name": name,
-        "total": 0,
-        "working": False,
-        "start": 0
-    }
+    uid = str(user.id)
+    data[uid] = make_attendance_entry(uid, normalize_name(user.display_name), 0, False, 0)
     save_attendance(data)
 
     await interaction.response.send_message(
-        f"{get_member_label_from_name(name)} 근무 데이터 초기화 완료",
+        f"{build_member_label(user)} 근무 데이터 초기화 완료",
         ephemeral=True
     )
-    await send_log(f"🛠 근무초기화 | {name}")
+    await send_log(f"🛠 근무초기화 | {build_member_label(user)}")
     await refresh_status_message()
 
 
@@ -667,20 +735,20 @@ async def resign_user(interaction: discord.Interaction, user: discord.Member):
     if not is_admin(interaction.user):
         return await interaction.response.send_message("권한 없음", ephemeral=True)
 
-    name = normalize_name(user.display_name)
+    uid = str(user.id)
 
     attendance = load_attendance()
     promo = load_promo()
 
     removed = False
 
-    if name in attendance:
-        del attendance[name]
+    if uid in attendance:
+        del attendance[uid]
         save_attendance(attendance)
         removed = True
 
-    if name in promo:
-        del promo[name]
+    if uid in promo:
+        del promo[uid]
         save_promo(promo)
         removed = True
 
@@ -688,11 +756,11 @@ async def resign_user(interaction: discord.Interaction, user: discord.Member):
         return await interaction.response.send_message("삭제할 데이터가 없습니다.", ephemeral=True)
 
     await interaction.response.send_message(
-        f"{get_member_label_from_name(name)} 퇴사처리 완료",
+        f"{build_member_label(user)} 퇴사처리 완료",
         ephemeral=True
     )
-    await send_log(f"🛠 퇴사처리 | {name}")
-    await send_promo_log(f"🛠 퇴사처리 | {name}")
+    await send_log(f"🛠 퇴사처리 | {build_member_label(user)}")
+    await send_promo_log(f"🛠 퇴사처리 | {build_member_label(user)}")
     await refresh_status_message()
     await refresh_promo_rank_message()
 
@@ -714,16 +782,19 @@ async def add_promo(interaction: discord.Interaction, user: discord.Member, coun
     if count <= 0:
         return await interaction.response.send_message("1 이상 입력해주세요.", ephemeral=True)
 
-    name = normalize_name(user.display_name)
     data = load_promo()
-    data[name] = int(data.get(name, 0)) + count
+    ensure_promo_user(user, data)
+    uid = str(user.id)
+
+    data[uid]["count"] = int(data[uid].get("count", 0)) + count
+    data[uid]["base_name"] = normalize_name(user.display_name)
     save_promo(data)
 
     await interaction.response.send_message(
-        f"{get_member_label_from_name(name)} 홍보 {count}회 추가 완료",
+        f"{build_member_label(user)} 홍보 {count}회 추가 완료",
         ephemeral=True
     )
-    await send_promo_log(f"🛠 홍보추가 | {name} (+{count})")
+    await send_promo_log(f"🛠 홍보추가 | {build_member_label(user)} (+{count})")
     await refresh_promo_rank_message()
 
 
@@ -735,20 +806,19 @@ async def remove_promo(interaction: discord.Interaction, user: discord.Member, c
     if count <= 0:
         return await interaction.response.send_message("1 이상 입력해주세요.", ephemeral=True)
 
-    name = normalize_name(user.display_name)
     data = load_promo()
+    ensure_promo_user(user, data)
+    uid = str(user.id)
 
-    if name not in data:
-        return await interaction.response.send_message("홍보 데이터가 없습니다.", ephemeral=True)
-
-    data[name] = max(0, int(data.get(name, 0)) - count)
+    data[uid]["count"] = max(0, int(data[uid].get("count", 0)) - count)
+    data[uid]["base_name"] = normalize_name(user.display_name)
     save_promo(data)
 
     await interaction.response.send_message(
-        f"{get_member_label_from_name(name)} 홍보 {count}회 차감 완료",
+        f"{build_member_label(user)} 홍보 {count}회 차감 완료",
         ephemeral=True
     )
-    await send_promo_log(f"🛠 홍보차감 | {name} (-{count})")
+    await send_promo_log(f"🛠 홍보차감 | {build_member_label(user)} (-{count})")
     await refresh_promo_rank_message()
 
 
@@ -760,16 +830,19 @@ async def set_promo(interaction: discord.Interaction, user: discord.Member, coun
     if count < 0:
         return await interaction.response.send_message("0 이상 입력해주세요.", ephemeral=True)
 
-    name = normalize_name(user.display_name)
     data = load_promo()
-    data[name] = count
+    ensure_promo_user(user, data)
+    uid = str(user.id)
+
+    data[uid]["count"] = count
+    data[uid]["base_name"] = normalize_name(user.display_name)
     save_promo(data)
 
     await interaction.response.send_message(
-        f"{get_member_label_from_name(name)} 홍보 {count}회 설정 완료",
+        f"{build_member_label(user)} 홍보 {count}회 설정 완료",
         ephemeral=True
     )
-    await send_promo_log(f"🛠 홍보설정 | {name} (= {count})")
+    await send_promo_log(f"🛠 홍보설정 | {build_member_label(user)} (= {count})")
     await refresh_promo_rank_message()
 
 
@@ -778,20 +851,20 @@ async def delete_promo(interaction: discord.Interaction, user: discord.Member):
     if not is_admin(interaction.user):
         return await interaction.response.send_message("권한 없음", ephemeral=True)
 
-    name = normalize_name(user.display_name)
+    uid = str(user.id)
     data = load_promo()
 
-    if name not in data:
+    if uid not in data:
         return await interaction.response.send_message("홍보 데이터가 없습니다.", ephemeral=True)
 
-    del data[name]
+    del data[uid]
     save_promo(data)
 
     await interaction.response.send_message(
-        f"{get_member_label_from_name(name)} 홍보 데이터 삭제 완료",
+        f"{build_member_label(user)} 홍보 데이터 삭제 완료",
         ephemeral=True
     )
-    await send_promo_log(f"🛠 홍보삭제 | {name}")
+    await send_promo_log(f"🛠 홍보삭제 | {build_member_label(user)}")
     await refresh_promo_rank_message()
 
 
@@ -809,12 +882,12 @@ async def combined_info(interaction: discord.Interaction, user: discord.Member):
     if not is_admin(interaction.user):
         return await interaction.response.send_message("권한 없음", ephemeral=True)
 
-    name = normalize_name(user.display_name)
+    uid = str(user.id)
     attendance = load_attendance()
     promo = load_promo()
 
-    work = attendance.get(name, {"total": 0, "working": False, "start": 0})
-    promo_count = int(promo.get(name, 0))
+    work = attendance.get(uid, make_attendance_entry(uid, normalize_name(user.display_name), 0, False, 0))
+    promo_info = promo.get(uid, make_promo_entry(uid, normalize_name(user.display_name), 0))
 
     current_extra = 0
     if work.get("working") and int(work.get("start", 0) or 0) > 0:
@@ -823,22 +896,25 @@ async def combined_info(interaction: discord.Interaction, user: discord.Member):
     total_text = format_seconds(int(work.get("total", 0)) + current_extra)
 
     msg = (
-        f"👤 {get_member_label_from_name(name)}\n"
+        f"👤 {build_member_label(user)}\n"
         f"🟢 현재 근무중: {'예' if work.get('working') else '아니오'}\n"
         f"⏱ 누적 근무시간: {total_text}\n"
-        f"📢 홍보 횟수: {promo_count}회"
+        f"📢 홍보 횟수: {int(promo_info.get('count', 0))}회"
     )
 
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-@bot.tree.command(name="중복정리", description="출퇴근/홍보 중복 데이터 강제 정리")
+@bot.tree.command(name="중복정리", description="기존 이름기반 중복 데이터 강제 정리")
 async def dedupe_data(interaction: discord.Interaction):
     if not is_admin(interaction.user):
         return await interaction.response.send_message("권한 없음", ephemeral=True)
 
-    save_attendance(load_attendance())
-    save_promo(load_promo())
+    att = load_attendance()
+    promo = load_promo()
+
+    save_attendance(att)
+    save_promo(promo)
 
     await refresh_status_message()
     await refresh_promo_rank_message()
@@ -891,6 +967,26 @@ async def setup_hook():
 
 
 @bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    try:
+        att = load_attendance()
+        promo = load_promo()
+
+        uid = str(after.id)
+        base_name = normalize_name(after.display_name)
+
+        if uid in att:
+            att[uid]["base_name"] = base_name
+            save_attendance(att)
+
+        if uid in promo:
+            promo[uid]["base_name"] = base_name
+            save_promo(promo)
+    except Exception as e:
+        print(f"on_member_update error: {e}")
+
+
+@bot.event
 async def on_ready():
     save_attendance(load_attendance())
     save_promo(load_promo())
@@ -927,15 +1023,19 @@ async def on_message(message: discord.Message):
             if ctype.startswith("image/") or filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")):
                 image_count += 1
 
-        if image_count > 0:
-            name = normalize_name(message.author.display_name)
+        if image_count > 0 and isinstance(message.author, discord.Member):
+            base_name = normalize_name(message.author.display_name)
 
-            if not is_excluded(name):
+            if not is_excluded(base_name):
                 data = load_promo()
-                data[name] = int(data.get(name, 0)) + image_count
+                ensure_promo_user(message.author, data)
+                uid = str(message.author.id)
+
+                data[uid]["count"] = int(data[uid].get("count", 0)) + image_count
+                data[uid]["base_name"] = base_name
                 save_promo(data)
 
-                await send_promo_log(f"홍보 인증 | {name} (+{image_count})")
+                await send_promo_log(f"홍보 인증 | {build_member_label(message.author)} (+{image_count})")
                 await refresh_promo_rank_message()
 
     await bot.process_commands(message)

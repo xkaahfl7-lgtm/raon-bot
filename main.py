@@ -3,6 +3,8 @@ import re
 import json
 import time
 import discord
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from discord.ext import commands, tasks
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -73,6 +75,10 @@ def now_ts() -> int:
     return int(time.time())
 
 
+def now_kst_text() -> str:
+    return datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def format_seconds(sec: int) -> str:
     if sec < 0:
         sec = 0
@@ -94,8 +100,10 @@ def load_json(path: str, default):
 
 
 def save_json(path: str, data):
-    with open(path, "w", encoding="utf-8") as f:
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, path)
 
 
 def load_message_id(path: str):
@@ -109,8 +117,10 @@ def load_message_id(path: str):
 
 
 def save_message_id(path: str, message_id: int):
-    with open(path, "w", encoding="utf-8") as f:
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
         f.write(str(message_id))
+    os.replace(temp_path, path)
 
 
 def normalize_name(name: str) -> str:
@@ -149,7 +159,7 @@ def normalize_name(name: str) -> str:
         "st이민우": "이민우",
         "st민우": "이민우",
         "minwoo": "이민우",
-        "lee minwoo": "이민우",
+        "leeminwoo": "이민우",
 
         "볶음": "볶음",
         "bokkeum": "볶음",
@@ -218,7 +228,7 @@ def find_member_by_uid(uid: str):
 
 
 def get_label_from_uid_or_name(uid: str = None, base_name: str = None) -> str:
-    if uid:
+    if uid and not str(uid).startswith("legacy::"):
         member = find_member_by_uid(uid)
         if member:
             return build_member_label(member)
@@ -266,7 +276,7 @@ def migrate_attendance(raw: dict) -> dict:
         if not isinstance(info, dict):
             continue
 
-        raw_name = str(info.get("display_name", key)).strip()
+        raw_name = str(info.get("display_name", info.get("base_name", key))).strip()
         base_name = normalize_name(raw_name)
 
         if not base_name or is_excluded(base_name):
@@ -341,11 +351,11 @@ async def send_record_embed(is_clock_in: bool, member: discord.Member, elapsed: 
 
     title = "🟢 출근" if is_clock_in else "🔴 퇴근"
     color = 0x2ECC71 if is_clock_in else 0xE74C3C
-    now_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    now_text = now_kst_text()
 
     desc = (
         f"## {title}\n\n"
-        f"**관리자**\n{member.mention}\n\n"
+        f"**관리자**\n{build_member_label(member)}\n\n"
         f"**시간**\n{now_text}"
     )
 
@@ -366,11 +376,14 @@ def build_status_embed(data: dict) -> discord.Embed:
         working = bool(info.get("working", False))
         start = int(info.get("start", 0) or 0)
 
+        current_total = total
+
         if working and start > 0:
             elapsed = now_ts() - start
             current_workers.append((label, elapsed))
+            current_total += elapsed
 
-        ranking.append((label, total))
+        ranking.append((label, current_total))
 
     current_workers.sort(key=lambda x: x[1], reverse=True)
     ranking.sort(key=lambda x: x[1], reverse=True)
@@ -385,7 +398,7 @@ def build_status_embed(data: dict) -> discord.Embed:
         for idx, (name, total) in enumerate(ranking[:10], start=1)
     ) if ranking else "데이터 없음"
 
-    return discord.Embed(
+    embed = discord.Embed(
         description=(
             "## 📊 관리자 근무확인\n\n"
             f"### 🟢 현재 근무중\n{current_text}\n\n"
@@ -393,6 +406,8 @@ def build_status_embed(data: dict) -> discord.Embed:
         ),
         color=0x3498DB
     )
+    embed.set_footer(text=f"마지막 갱신: {now_kst_text()}")
+    return embed
 
 
 async def refresh_status_message():
@@ -526,7 +541,7 @@ def migrate_promo(raw: dict) -> dict:
 
         if isinstance(value, dict):
             uid = value.get("user_id")
-            base_name = normalize_name(value.get("base_name", key))
+            base_name = normalize_name(value.get("base_name", value.get("display_name", key)))
             count = int(value.get("count", 0) or 0)
         else:
             base_name = normalize_name(key)
@@ -927,7 +942,7 @@ async def dedupe_data(interaction: discord.Interaction):
 # =========================
 # 자동 갱신
 # =========================
-@tasks.loop(seconds=60)
+@tasks.loop(seconds=10)
 async def auto_update_status():
     await refresh_status_message()
 

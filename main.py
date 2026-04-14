@@ -33,6 +33,7 @@ ATTENDANCE_FILE = "attendance.json"
 PROMO_FILE = "promo.json"
 STATUS_MSG_FILE = "status_message_id.txt"
 PROMO_MSG_FILE = "promo_message_id.txt"
+RESTORE_FLAG_FILE = "attendance_restore_once.flag"
 
 # =========================
 # 제외 대상
@@ -47,6 +48,7 @@ DEFAULT_ATTENDANCE = {
     "우진": 54 * 3600,
     "봉식": 47 * 3600,
     "이민우": 36 * 3600,
+    "김강혁": 0,
 }
 
 DEFAULT_PROMO = {
@@ -54,6 +56,15 @@ DEFAULT_PROMO = {
     "우진": 711,
     "이민우": 157,
     "알루": 75,
+}
+
+# =========================
+# 수동 복구용 현재 근무자
+# 한 번만 적용됨
+# =========================
+MANUAL_RESTORE_WORKERS = {
+    "이민우": 4 * 3600,      # 4시간 근무중
+    "김강혁": 90 * 60,       # 1시간 30분 근무중
 }
 
 intents = discord.Intents.default()
@@ -84,7 +95,8 @@ def format_seconds(sec: int) -> str:
         sec = 0
     h = sec // 3600
     m = (sec % 3600) // 60
-    return f"{h}시간 {m:02d}분"
+    s = sec % 60
+    return f"{h}시간 {m:02d}분 {s:02d}초"
 
 
 def load_json(path: str, default):
@@ -103,6 +115,8 @@ def save_json(path: str, data):
     temp_path = f"{path}.tmp"
     with open(temp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(temp_path, path)
 
 
@@ -120,6 +134,8 @@ def save_message_id(path: str, message_id: int):
     temp_path = f"{path}.tmp"
     with open(temp_path, "w", encoding="utf-8") as f:
         f.write(str(message_id))
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(temp_path, path)
 
 
@@ -139,6 +155,9 @@ def normalize_name(name: str) -> str:
     if "ᆞ" in name:
         name = name.split("ᆞ")[-1]
 
+    # [임시], [대기], ⭐ 같은 장식 제거
+    name = re.sub(r"\[[^\]]+\]", "", name)
+    name = name.replace("⭐", "").replace("🌟", "").replace("🐣", "")
     name = name.replace(" ", "")
     name = re.sub(r"[^가-힣a-zA-Z0-9]", "", name)
 
@@ -163,10 +182,16 @@ def normalize_name(name: str) -> str:
 
         "볶음": "볶음",
         "bokkeum": "볶음",
+        "김남정": "김남정",
+        "남정": "김남정",
 
         "알루": "알루",
         "alroo": "알루",
         "alru": "알루",
+
+        "김강혁": "김강혁",
+        "강혁": "김강혁",
+        "kanghyuk": "김강혁",
     }
     return alias_map.get(lower, name)
 
@@ -186,7 +211,9 @@ def get_role_prefix(member: discord.Member) -> str:
         ("DEV", "DEV"),
         ("개발자", "DEV"),
         ("AM", "AM"),
+        ("관리자", "AM"),
         ("IG", "IG"),
+        ("인게임관리자", "IG"),
         ("ST", "ST"),
         ("STAFF", "ST"),
         ("스태프", "ST"),
@@ -220,6 +247,8 @@ def resolve_uid_for_base_name(base_name: str):
 
 
 def find_member_by_uid(uid: str):
+    if not uid or str(uid).startswith("legacy::"):
+        return None
     for guild in bot.guilds:
         member = guild.get_member(int(uid))
         if member:
@@ -228,7 +257,7 @@ def find_member_by_uid(uid: str):
 
 
 def get_label_from_uid_or_name(uid: str = None, base_name: str = None) -> str:
-    if uid and not str(uid).startswith("legacy::"):
+    if uid:
         member = find_member_by_uid(uid)
         if member:
             return build_member_label(member)
@@ -344,6 +373,63 @@ def ensure_attendance_user(member: discord.Member, data: dict):
         data[uid]["base_name"] = base_name
 
 
+def write_restore_flag():
+    temp_path = f"{RESTORE_FLAG_FILE}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        f.write(now_kst_text())
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp_path, RESTORE_FLAG_FILE)
+
+
+async def restore_manual_current_workers_once():
+    if os.path.exists(RESTORE_FLAG_FILE):
+        return
+
+    data = load_attendance()
+    now = now_ts()
+    restored_names = []
+
+    for base_name, elapsed_seconds in MANUAL_RESTORE_WORKERS.items():
+        normalized = normalize_name(base_name)
+        uid = resolve_uid_for_base_name(normalized)
+
+        if uid:
+            member = find_member_by_uid(uid)
+            if member:
+                ensure_attendance_user(member, data)
+                data[uid]["base_name"] = normalize_name(member.display_name)
+                data[uid]["working"] = True
+                data[uid]["start"] = now - int(elapsed_seconds)
+                if data[uid]["total"] < DEFAULT_ATTENDANCE.get(normalized, 0):
+                    data[uid]["total"] = DEFAULT_ATTENDANCE.get(normalized, 0)
+                restored_names.append(build_member_label(member))
+                continue
+
+        legacy_uid = f"legacy::{normalized}"
+        if legacy_uid not in data:
+            data[legacy_uid] = make_attendance_entry(
+                legacy_uid,
+                normalized,
+                DEFAULT_ATTENDANCE.get(normalized, 0),
+                True,
+                now - int(elapsed_seconds)
+            )
+        else:
+            data[legacy_uid]["base_name"] = normalized
+            data[legacy_uid]["working"] = True
+            data[legacy_uid]["start"] = now - int(elapsed_seconds)
+            if data[legacy_uid]["total"] < DEFAULT_ATTENDANCE.get(normalized, 0):
+                data[legacy_uid]["total"] = DEFAULT_ATTENDANCE.get(normalized, 0)
+        restored_names.append(normalized)
+
+    save_attendance(data)
+    write_restore_flag()
+
+    if restored_names:
+        await send_log("🛠 현재 근무자 수동 복구 완료 | " + ", ".join(restored_names))
+
+
 async def send_record_embed(is_clock_in: bool, member: discord.Member, elapsed: int = 0):
     ch = bot.get_channel(RECORD_CHANNEL_ID)
     if not isinstance(ch, discord.TextChannel):
@@ -417,8 +503,6 @@ async def refresh_status_message():
         return
 
     data = load_attendance()
-    save_attendance(data)
-
     embed = build_status_embed(data)
     msg_id = load_message_id(STATUS_MSG_FILE)
 
@@ -606,7 +690,6 @@ async def refresh_promo_rank_message():
         return
 
     data = load_promo()
-    save_promo(data)
 
     sorted_items = sorted(
         data.items(),
@@ -1003,9 +1086,6 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
 @bot.event
 async def on_ready():
-    save_attendance(load_attendance())
-    save_promo(load_promo())
-
     try:
         synced = await bot.tree.sync()
         print(f"슬래시 명령어 동기화 완료: {len(synced)}개")
@@ -1014,6 +1094,7 @@ async def on_ready():
 
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
+    await restore_manual_current_workers_once()
     await rebuild_button_message()
     await refresh_status_message()
     await refresh_promo_rank_message()

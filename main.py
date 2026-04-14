@@ -30,7 +30,7 @@ PROMO_LOG_CHANNEL_ID = 1481661104580067419    # 홍보-로그
 # =========================
 # 파일
 # =========================
-ATTENDANCE_FILE = "attendance.json"
+ATTENDANCE_FILE = "attendance.json"   # 절대 유지
 PROMO_FILE = "promo.json"
 STATUS_MSG_FILE = "status_message_id.txt"
 PROMO_MSG_FILE = "promo_message_id.txt"
@@ -161,6 +161,9 @@ def normalize_name(name: str) -> str:
         "알루": "알루",
         "alroo": "알루",
         "alru": "알루",
+
+        "오리": "오리",
+        "ori": "오리",
     }
     return alias_map.get(lower, name or "알수없음")
 
@@ -642,6 +645,7 @@ def build_promo_rank_content(data: dict) -> str:
     )
 
     lines = ["📊 홍보 횟수", ""]
+
     if not sorted_items:
         lines.append("데이터 없음")
     else:
@@ -650,6 +654,7 @@ def build_promo_rank_content(data: dict) -> str:
             lines.append(f"{label} — {int(info.get('count', 0))}회")
 
     lines += ["", "🏆 TOP 10"]
+
     if not sorted_items:
         lines.append("데이터 없음")
     else:
@@ -699,7 +704,7 @@ async def recount_promo_channel(full_reset: bool = True) -> Tuple[int, int, int]
         for base_name, count in DEFAULT_PROMO.items():
             uid = resolve_uid_for_base_name(base_name)
             if not uid:
-                continue
+                uid = f"legacy::{normalize_name(base_name)}"
             base[uid] = make_promo_entry(uid, base_name, count)
 
     scanned_messages = 0
@@ -845,7 +850,7 @@ async def reset_work_time(interaction: discord.Interaction, user: discord.Member
     await refresh_status_message()
 
 
-@bot.tree.command(name="퇴사처리", description="출퇴근/홍보 데이터 삭제")
+@bot.tree.command(name="퇴사처리", description="서버에 있는 유저를 멘션으로 삭제")
 @app_commands.describe(user="퇴사처리할 유저")
 async def resign_user(interaction: discord.Interaction, user: discord.Member):
     if not is_admin(interaction.user):
@@ -863,8 +868,15 @@ async def resign_user(interaction: discord.Interaction, user: discord.Member):
 
     if uid in promo:
         del promo[uid]
-        save_promo(promo)
         removed = True
+
+    if "__meta__" in promo and "counted_messages" in promo["__meta__"]:
+        for msg_id, msg_info in list(promo["__meta__"]["counted_messages"].items()):
+            msg_uid = str(msg_info.get("user_id", ""))
+            if msg_uid == uid:
+                del promo["__meta__"]["counted_messages"][msg_id]
+
+    save_promo(promo)
 
     if not removed:
         return await interaction.response.send_message("삭제할 데이터가 없습니다.", ephemeral=True)
@@ -872,6 +884,64 @@ async def resign_user(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.send_message(f"{build_member_label(user)} 퇴사처리 완료", ephemeral=True)
     await send_log(f"🛠 퇴사처리 | {build_member_label(user)}")
     await send_promo_log(f"🛠 퇴사처리 | {build_member_label(user)}")
+    await refresh_status_message()
+    await refresh_promo_rank_message()
+
+
+@bot.tree.command(name="퇴사처리이름", description="서버에 없는 유저도 이름으로 데이터 삭제")
+@app_commands.describe(name="삭제할 닉네임")
+async def resign_user_by_name(interaction: discord.Interaction, name: str):
+    if not is_admin(interaction.user):
+        return await interaction.response.send_message("권한 없음", ephemeral=True)
+
+    target = normalize_name(name)
+
+    attendance = load_attendance()
+    promo = load_promo()
+
+    removed = False
+    removed_uids = set()
+
+    for uid, info in list(attendance.items()):
+        base_name = normalize_name(info.get("base_name", ""))
+        if base_name == target:
+            removed = True
+            removed_uids.add(uid)
+            del attendance[uid]
+
+    for uid, info in list(promo.items()):
+        if uid == "__meta__":
+            continue
+
+        base_name = normalize_name(info.get("base_name", ""))
+        if base_name == target:
+            removed = True
+            removed_uids.add(uid)
+            del promo[uid]
+
+    if "__meta__" in promo and "counted_messages" in promo["__meta__"]:
+        for msg_id, msg_info in list(promo["__meta__"]["counted_messages"].items()):
+            msg_uid = str(msg_info.get("user_id", ""))
+            if msg_uid in removed_uids:
+                del promo["__meta__"]["counted_messages"][msg_id]
+
+    if not removed:
+        return await interaction.response.send_message(
+            f"{target} 데이터가 없습니다.",
+            ephemeral=True
+        )
+
+    save_attendance(attendance)
+    save_promo(promo)
+
+    await interaction.response.send_message(
+        f"{target} 퇴사처리 완료",
+        ephemeral=True
+    )
+
+    await send_log(f"🛠 퇴사처리(이름) | {target}")
+    await send_promo_log(f"🛠 퇴사처리(이름) | {target}")
+
     await refresh_status_message()
     await refresh_promo_rank_message()
 

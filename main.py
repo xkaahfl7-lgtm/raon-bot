@@ -191,7 +191,6 @@ def load_json(path: str, default: Any):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        # 깨졌으면 bak 복구 시도
         bak_path = f"{path}.bak"
         if os.path.exists(bak_path):
             try:
@@ -247,11 +246,7 @@ def normalize_name(name: str) -> str:
             continue
         filtered.append(token)
 
-    if filtered:
-        cleaned = filtered[-1]
-    else:
-        cleaned = tokens[-1]
-
+    cleaned = filtered[-1] if filtered else tokens[-1]
     cleaned = cleaned.replace(" ", "")
     cleaned = re.sub(r"[^가-힣a-zA-Z0-9]", "", cleaned)
 
@@ -281,6 +276,10 @@ def normalize_name(name: str) -> str:
     return raw or "알수없음"
 
 
+def canonical_name(name: str) -> str:
+    return normalize_name(name)
+
+
 def soft_normalize_name(name: str) -> str:
     name = str(name or "").strip()
     if not name:
@@ -293,12 +292,12 @@ def soft_normalize_name(name: str) -> str:
 
 def names_match(a: str, b: str) -> bool:
     a_candidates = {
-        normalize_name(a),
+        canonical_name(a),
         soft_normalize_name(a),
         str(a).replace(" ", "").lower()
     }
     b_candidates = {
-        normalize_name(b),
+        canonical_name(b),
         soft_normalize_name(b),
         str(b).replace(" ", "").lower()
     }
@@ -317,7 +316,7 @@ def names_match(a: str, b: str) -> bool:
 
 
 def is_excluded(name: str) -> bool:
-    return normalize_name(name) in EXCLUDED_NAMES
+    return canonical_name(name) in EXCLUDED_NAMES
 
 
 def get_role_prefix(member: discord.Member) -> str:
@@ -347,7 +346,7 @@ def get_role_prefix(member: discord.Member) -> str:
 
 
 def build_member_label(member: discord.Member) -> str:
-    base = normalize_name(member.display_name)
+    base = canonical_name(member.display_name)
     prefix = get_role_prefix(member)
     return f"{prefix}ㆍ{base}" if prefix else base
 
@@ -365,12 +364,29 @@ def find_member_by_uid(uid: str):
     return None
 
 
+def find_member_by_base_name(base_name: str):
+    target = canonical_name(base_name)
+    for guild in bot.guilds:
+        for member in guild.members:
+            if member.bot:
+                continue
+            if canonical_name(member.display_name) == target:
+                return member
+    return None
+
+
 def get_label_from_uid_or_name(uid: str = None, base_name: str = None) -> str:
     if uid and not str(uid).startswith("legacy::"):
         member = find_member_by_uid(uid)
         if member:
             return build_member_label(member)
-    return normalize_name(base_name or "알수없음")
+
+    if base_name:
+        member = find_member_by_base_name(base_name)
+        if member:
+            return build_member_label(member)
+
+    return canonical_name(base_name or "알수없음")
 
 
 async def send_log(text: str):
@@ -399,7 +415,7 @@ async def send_promo_log(text: str):
 def make_attendance_entry(uid: str, base_name: str, total: int = 0, working: bool = False, start: int = 0) -> dict:
     return {
         "user_id": str(uid),
-        "base_name": normalize_name(base_name),
+        "base_name": canonical_name(base_name),
         "total": int(total),
         "working": bool(working),
         "start": int(start) if working else 0,
@@ -417,7 +433,7 @@ def migrate_attendance(raw: Dict[str, Any]) -> Dict[str, Any]:
             continue
 
         raw_name = str(info.get("display_name") or info.get("base_name") or key).strip()
-        base_name = normalize_name(raw_name)
+        base_name = canonical_name(raw_name)
         if not base_name or is_excluded(base_name):
             continue
 
@@ -432,14 +448,63 @@ def migrate_attendance(raw: Dict[str, Any]) -> Dict[str, Any]:
             migrated[uid]["total"] += total
             if working:
                 migrated[uid]["working"] = True
-                if migrated[uid]["start"] == 0 or (start > 0 and start < migrated[uid]["start"]):
+                old_start = int(migrated[uid].get("start", 0) or 0)
+                if old_start == 0 or (start > 0 and start < old_start):
                     migrated[uid]["start"] = start
 
     return migrated
 
 
+def merge_same_person_attendance(data: Dict[str, Any]) -> Dict[str, Any]:
+    merged = {}
+    by_name_uid = {}
+
+    for uid, info in data.items():
+        if not isinstance(info, dict):
+            continue
+
+        base = canonical_name(info.get("base_name", uid))
+        if not base:
+            continue
+
+        if base not in by_name_uid:
+            by_name_uid[base] = uid
+            merged[uid] = {
+                "user_id": uid,
+                "base_name": base,
+                "total": int(info.get("total", 0) or 0),
+                "working": bool(info.get("working", False)),
+                "start": int(info.get("start", 0) or 0),
+            }
+            continue
+
+        target_uid = by_name_uid[base]
+        target = merged[target_uid]
+
+        target["total"] += int(info.get("total", 0) or 0)
+
+        if bool(info.get("working", False)):
+            target["working"] = True
+            start = int(info.get("start", 0) or 0)
+            old_start = int(target.get("start", 0) or 0)
+            if old_start == 0:
+                target["start"] = start
+            elif start > 0:
+                target["start"] = min(old_start, start)
+
+        if str(target_uid).startswith("legacy::") and not str(uid).startswith("legacy::"):
+            merged[uid] = merged.pop(target_uid)
+            merged[uid]["user_id"] = uid
+            by_name_uid[base] = uid
+
+    return merged
+
+
 def load_attendance() -> Dict[str, Any]:
-    return migrate_attendance(load_json(ATTENDANCE_FILE, INITIAL_ATTENDANCE))
+    data = migrate_attendance(load_json(ATTENDANCE_FILE, INITIAL_ATTENDANCE))
+    data = merge_same_person_attendance(data)
+    save_attendance(data)
+    return data
 
 
 def save_attendance(data: Dict[str, Any]):
@@ -448,11 +513,45 @@ def save_attendance(data: Dict[str, Any]):
 
 def ensure_attendance_user(member: discord.Member, data: Dict[str, Any]):
     uid = str(member.id)
-    base_name = normalize_name(member.display_name)
-    if uid not in data:
-        data[uid] = make_attendance_entry(uid, base_name, 0, False, 0)
-    else:
+    base_name = canonical_name(member.display_name)
+
+    if uid in data:
         data[uid]["base_name"] = base_name
+        return
+
+    legacy_keys = []
+    for key, info in data.items():
+        if not isinstance(info, dict):
+            continue
+        info_name = canonical_name(info.get("base_name", key))
+        if names_match(base_name, info_name):
+            legacy_keys.append(key)
+
+    if not legacy_keys:
+        data[uid] = make_attendance_entry(uid, base_name, 0, False, 0)
+        return
+
+    merged_total = 0
+    merged_working = False
+    merged_start = 0
+
+    for key in legacy_keys:
+        info = data.get(key, {})
+        merged_total += int(info.get("total", 0) or 0)
+
+        if bool(info.get("working", False)):
+            merged_working = True
+            start = int(info.get("start", 0) or 0)
+            if merged_start == 0:
+                merged_start = start
+            elif start > 0:
+                merged_start = min(merged_start, start)
+
+    data[uid] = make_attendance_entry(uid, base_name, merged_total, merged_working, merged_start)
+
+    for key in legacy_keys:
+        if key != uid and key in data:
+            del data[key]
 
 
 async def send_record_embed(is_clock_in: bool, member: discord.Member, elapsed: int = 0):
@@ -552,7 +651,7 @@ class AttendanceView(discord.ui.View):
             return await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
 
         member = interaction.user
-        base_name = normalize_name(member.display_name)
+        base_name = canonical_name(member.display_name)
 
         if is_excluded(base_name):
             return await interaction.response.send_message("제외 대상입니다.", ephemeral=True)
@@ -581,6 +680,7 @@ class AttendanceView(discord.ui.View):
 
         member = interaction.user
         data = load_attendance()
+        ensure_attendance_user(member, data)
         uid = str(member.id)
 
         if uid not in data:
@@ -600,7 +700,7 @@ class AttendanceView(discord.ui.View):
         data[uid]["total"] = int(data[uid].get("total", 0)) + elapsed
         data[uid]["working"] = False
         data[uid]["start"] = 0
-        data[uid]["base_name"] = normalize_name(member.display_name)
+        data[uid]["base_name"] = canonical_name(member.display_name)
         save_attendance(data)
 
         await interaction.response.send_message(
@@ -615,19 +715,10 @@ class AttendanceView(discord.ui.View):
 # =========================
 # 홍보
 # =========================
-def default_promo_state() -> dict:
-    return {
-        "__meta__": {
-            "counted_messages": {},
-            "last_recount_at": 0
-        }
-    }
-
-
 def make_promo_entry(uid: str, base_name: str, count: int = 0) -> dict:
     return {
         "user_id": str(uid),
-        "base_name": normalize_name(base_name),
+        "base_name": canonical_name(base_name),
         "count": int(count),
     }
 
@@ -654,12 +745,11 @@ def migrate_promo(raw: Dict[str, Any]) -> Dict[str, Any]:
     for key, value in raw.items():
         if key == "__meta__":
             continue
-
         if not isinstance(value, dict):
             continue
 
         uid = str(value.get("user_id") or key)
-        base_name = normalize_name(value.get("base_name", key))
+        base_name = canonical_name(value.get("base_name", key))
         count = int(value.get("count", 0) or 0)
 
         if not base_name or is_excluded(base_name):
@@ -673,21 +763,50 @@ def migrate_promo(raw: Dict[str, Any]) -> Dict[str, Any]:
     return migrated
 
 
+def merge_same_person_promo(data: Dict[str, Any]) -> Dict[str, Any]:
+    merged = {"__meta__": data.get("__meta__", {"counted_messages": {}, "last_recount_at": 0})}
+    by_name_uid = {}
+
+    for uid, info in data.items():
+        if uid == "__meta__":
+            continue
+        if not isinstance(info, dict):
+            continue
+
+        base = canonical_name(info.get("base_name", uid))
+        if not base:
+            continue
+
+        if base not in by_name_uid:
+            by_name_uid[base] = uid
+            merged[uid] = {
+                "user_id": uid,
+                "base_name": base,
+                "count": int(info.get("count", 0) or 0),
+            }
+            continue
+
+        target_uid = by_name_uid[base]
+        target = merged[target_uid]
+        target["count"] += int(info.get("count", 0) or 0)
+
+        if str(target_uid).startswith("legacy::") and not str(uid).startswith("legacy::"):
+            merged[uid] = merged.pop(target_uid)
+            merged[uid]["user_id"] = uid
+            by_name_uid[base] = uid
+
+    return merged
+
+
 def load_promo() -> Dict[str, Any]:
-    return migrate_promo(load_json(PROMO_FILE, INITIAL_PROMO))
+    data = migrate_promo(load_json(PROMO_FILE, INITIAL_PROMO))
+    data = merge_same_person_promo(data)
+    save_promo(data)
+    return data
 
 
 def save_promo(data: Dict[str, Any]):
     atomic_save_json(PROMO_FILE, data)
-
-
-def ensure_promo_user(member: discord.Member, data: Dict[str, Any]):
-    uid = str(member.id)
-    base_name = normalize_name(member.display_name)
-    if uid not in data:
-        data[uid] = make_promo_entry(uid, base_name, 0)
-    else:
-        data[uid]["base_name"] = base_name
 
 
 def ensure_promo_meta(data: Dict[str, Any]):
@@ -697,6 +816,49 @@ def ensure_promo_meta(data: Dict[str, Any]):
         data["__meta__"]["counted_messages"] = {}
     if "last_recount_at" not in data["__meta__"]:
         data["__meta__"]["last_recount_at"] = 0
+
+
+def ensure_promo_user(member: discord.Member, data: Dict[str, Any]):
+    uid = str(member.id)
+    base_name = canonical_name(member.display_name)
+
+    if uid in data:
+        data[uid]["base_name"] = base_name
+        return
+
+    legacy_keys = []
+    for key, info in data.items():
+        if key == "__meta__":
+            continue
+        if not isinstance(info, dict):
+            continue
+        info_name = canonical_name(info.get("base_name", key))
+        if names_match(base_name, info_name):
+            legacy_keys.append(key)
+
+    if not legacy_keys:
+        data[uid] = make_promo_entry(uid, base_name, 0)
+        return
+
+    merged_count = 0
+    old_message_owner_ids = set()
+
+    for key in legacy_keys:
+        info = data.get(key, {})
+        merged_count += int(info.get("count", 0) or 0)
+        old_message_owner_ids.add(str(info.get("user_id", key)))
+
+    data[uid] = make_promo_entry(uid, base_name, merged_count)
+
+    for key in legacy_keys:
+        if key != uid and key in data:
+            del data[key]
+
+    ensure_promo_meta(data)
+    for msg_id, msg_info in list(data["__meta__"]["counted_messages"].items()):
+        msg_uid = str(msg_info.get("user_id", ""))
+        if msg_uid in old_message_owner_ids:
+            data["__meta__"]["counted_messages"][msg_id]["user_id"] = uid
 
 
 def iter_promo_users(data: Dict[str, Any]):
@@ -724,7 +886,7 @@ def count_promo_attachments(message: discord.Message) -> int:
 def build_promo_rank_content(data: Dict[str, Any]) -> str:
     sorted_items = sorted(
         list(iter_promo_users(data)),
-        key=lambda x: (-int(x[1].get("count", 0)), normalize_name(x[1].get("base_name", "")))
+        key=lambda x: (-int(x[1].get("count", 0)), canonical_name(x[1].get("base_name", "")))
     )
 
     lines = ["📊 홍보 횟수", ""]
@@ -784,6 +946,7 @@ async def recount_promo_channel(full_reset: bool = True) -> Tuple[int, int, int]
     if full_reset:
         base = json.loads(json.dumps(INITIAL_PROMO))
         ensure_promo_meta(base)
+        base = merge_same_person_promo(base)
 
     scanned_messages = 0
     counted_images = 0
@@ -800,13 +963,30 @@ async def recount_promo_channel(full_reset: bool = True) -> Tuple[int, int, int]
 
         scanned_messages += 1
         uid = str(message.author.id)
-        base_name = normalize_name(getattr(message.author, "display_name", message.author.name))
+        base_name = canonical_name(getattr(message.author, "display_name", message.author.name))
 
         if is_excluded(base_name):
             continue
 
+        member = message.author if isinstance(message.author, discord.Member) else None
+        if member:
+            ensure_promo_user(member, base)
+
         if uid not in base:
-            base[uid] = make_promo_entry(uid, base_name, 0)
+            # 같은 이름 legacy가 있을 수도 있으니 한 번 더 확인
+            matched_uid = None
+            for key, info in base.items():
+                if key == "__meta__":
+                    continue
+                if names_match(base_name, info.get("base_name", key)):
+                    matched_uid = key
+                    break
+
+            if matched_uid and matched_uid != uid:
+                old = base.pop(matched_uid)
+                base[uid] = make_promo_entry(uid, base_name, int(old.get("count", 0) or 0))
+            else:
+                base[uid] = make_promo_entry(uid, base_name, 0)
 
         base[uid]["base_name"] = base_name
         base[uid]["count"] = int(base[uid].get("count", 0)) + image_count
@@ -850,7 +1030,7 @@ async def force_clock_out(interaction: discord.Interaction, user: discord.Member
 
     data[uid]["working"] = False
     data[uid]["start"] = 0
-    data[uid]["base_name"] = normalize_name(user.display_name)
+    data[uid]["base_name"] = canonical_name(user.display_name)
     save_attendance(data)
 
     await interaction.response.send_message(
@@ -874,7 +1054,7 @@ async def add_work_time(interaction: discord.Interaction, user: discord.Member, 
     uid = str(user.id)
 
     data[uid]["total"] = int(data[uid].get("total", 0)) + (hours * 3600)
-    data[uid]["base_name"] = normalize_name(user.display_name)
+    data[uid]["base_name"] = canonical_name(user.display_name)
     save_attendance(data)
 
     await interaction.response.send_message(
@@ -898,7 +1078,7 @@ async def remove_work_time(interaction: discord.Interaction, user: discord.Membe
     uid = str(user.id)
 
     data[uid]["total"] = max(0, int(data[uid].get("total", 0)) - (hours * 3600))
-    data[uid]["base_name"] = normalize_name(user.display_name)
+    data[uid]["base_name"] = canonical_name(user.display_name)
     save_attendance(data)
 
     await interaction.response.send_message(
@@ -917,7 +1097,7 @@ async def reset_work_time(interaction: discord.Interaction, user: discord.Member
 
     data = load_attendance()
     uid = str(user.id)
-    data[uid] = make_attendance_entry(uid, normalize_name(user.display_name), 0, False, 0)
+    data[uid] = make_attendance_entry(uid, canonical_name(user.display_name), 0, False, 0)
     save_attendance(data)
 
     await interaction.response.send_message(
@@ -1012,7 +1192,7 @@ async def resign_user_by_name(interaction: discord.Interaction, name: str):
     save_attendance(attendance)
     save_promo(promo)
 
-    removed_text = ", ".join(sorted({normalize_name(x) for x in removed_names if x})) or target
+    removed_text = ", ".join(sorted({canonical_name(x) for x in removed_names if x})) or target
 
     await interaction.response.send_message(
         f"퇴사처리 완료: {removed_text}",
@@ -1118,14 +1298,31 @@ async def on_message(message: discord.Message):
             data = load_promo()
             ensure_promo_meta(data)
 
-            msg_id = str(message.id)
-            if msg_id not in data["__meta__"]["counted_messages"]:
-                uid = str(message.author.id)
-                base_name = normalize_name(getattr(message.author, "display_name", message.author.name))
+            uid = str(message.author.id)
+            base_name = canonical_name(getattr(message.author, "display_name", message.author.name))
 
-                if not is_excluded(base_name):
+            if not is_excluded(base_name):
+                if isinstance(message.author, discord.Member):
+                    ensure_promo_user(message.author, data)
+                    uid = str(message.author.id)
+
+                msg_id = str(message.id)
+                if msg_id not in data["__meta__"]["counted_messages"]:
                     if uid not in data:
-                        data[uid] = make_promo_entry(uid, base_name, 0)
+                        # 혹시 member가 아닌 경우 대비
+                        matched_uid = None
+                        for key, info in data.items():
+                            if key == "__meta__":
+                                continue
+                            if names_match(base_name, info.get("base_name", key)):
+                                matched_uid = key
+                                break
+
+                        if matched_uid and matched_uid != uid:
+                            old = data.pop(matched_uid)
+                            data[uid] = make_promo_entry(uid, base_name, int(old.get("count", 0) or 0))
+                        else:
+                            data[uid] = make_promo_entry(uid, base_name, 0)
 
                     data[uid]["base_name"] = base_name
                     data[uid]["count"] = int(data[uid].get("count", 0)) + added
@@ -1181,7 +1378,6 @@ async def on_ready():
     except Exception as e:
         print(f"❌ 슬래시 명령어 동기화 실패: {e}")
 
-    # 파일 자동 생성
     load_attendance()
     load_promo()
 
